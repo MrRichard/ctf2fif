@@ -1,0 +1,29 @@
+[
+  {
+    "field": "subject_id",
+    "prompt": "Subject ID (e.g. M123324354)",
+    "pattern": "^M\\d{9}$",
+    "target": "subject_info.his_id",
+    "required": true
+  },
+  {
+    "field": "project",
+    "prompt": "Project name",
+    "pattern": "^[A-Za-z0-9_-]{1,32}$",
+    "target": "proj_name",
+    "required": true
+  },
+  {
+    "field": "experimenter",
+    "prompt": "Experimenter initials",
+    "pattern": "^[A-Z]{2,4}$",
+    "target": "experimenter",
+    "required": false
+  },
+  {
+    "field": "session_id",
+    "prompt": "Session ID (e.g. S01)",
+    "pattern": "^S\\d{2}$",
+    "required": false
+  }
+]
