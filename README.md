@@ -81,11 +81,35 @@ python ctf2fif.py data.ds -f fields.json --set subject_id=M123324354 --set proje
 | `--no-prompt`   | Never prompt; fail if a required field is missing.                |
 | `--overwrite`   | Overwrite existing FIF files.                                     |
 | `--report-dir`  | Directory for report logs (default: `./reports`).                 |
+| `--qa`          | Add a QA comparison of each input `.ds` against its output `.fif` to the run report. |
+
+## QA comparison
+
+With `--qa`, each conversion is followed by a QA check that correlates the
+converted FIF against its CTF source, channel by channel (matched by name).
+The full comparison is appended to the same report file as the conversion, so
+the run's log is a single, self-contained, human-reviewable record.
+
+```bash
+python ctf2fif.py sub-001.ds -o sub-001_raw.fif --qa
+```
+
+Each comparison block records channel counts, sampling rate, duration,
+correlation statistics (min/p05/median/p95/max), any flat/dead or
+low-correlation channels, a worst-channels table, and a status:
+
+- **PASS** — median correlation ≥ 0.999 and no channel below 0.99.
+- **WARN** — median correlation ≥ 0.99.
+- **FAIL** — otherwise, or if the CTF and FIF channel sets differ.
+
+A QA `FAIL` counts toward the run's failure exit code (a summary line is also
+printed to STDOUT).
 
 ## Reports
 
 Every run writes a uniquely named log file to `./reports` (configurable with
-`--report-dir`). Errors are also printed to STDOUT.
+`--report-dir`). Errors are also printed to STDOUT. When `--qa` is used, the
+QA comparison blocks are appended to that same log file.
 
 ## License
 

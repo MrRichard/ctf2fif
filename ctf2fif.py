@@ -34,6 +34,13 @@ NESTED_TARGETS = {
 }
 INT_KEYS = {"hand", "sex"}
 
+# QA comparison thresholds (see run_qa).
+QA_PASS = 0.999          # median correlation required for PASS
+QA_WARN = 0.99           # median correlation required for WARN
+QA_LOW = 0.99            # per-channel correlation below this is "low"
+QA_FLAT_REL = 1e-9       # channel std below this fraction of the median std is flat
+QA_FLAT_ABS = 0.0        # absolute std floor for flat-channel detection
+
 log = logging.getLogger("ctf2fif")
 
 
@@ -169,9 +176,205 @@ def convert(ds: Path, out: Path, defs: list, presets: dict,
     return out
 
 
+def _row_correlation(a, b):
+    """Pearson correlation per row between two (n_channels, n_samples) arrays.
+
+    Rows with zero variance (e.g. flat channels) yield NaN instead of raising.
+    """
+    import numpy as np
+
+    a = a - a.mean(axis=1, keepdims=True)
+    b = b - b.mean(axis=1, keepdims=True)
+    denom = np.sqrt((a * a).sum(axis=1) * (b * b).sum(axis=1))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (a * b).sum(axis=1) / denom
+
+
+def run_qa(ctf_path: Path, fif_path: Path) -> dict:
+    """Compare a source CTF .ds against a converted FIF file.
+
+    Returns a result dict describing the PASS/WARN/FAIL status plus the
+    numbers needed to build a human-reviewable report (see format_qa_report).
+    """
+    import numpy as np
+    import mne
+
+    result = {
+        "status": "FAIL",
+        "score": None,
+        "reason": None,
+        "error": None,
+        "n_channels_ctf": None,
+        "n_channels_fif": None,
+        "channels_compared": 0,
+        "sfreq_ctf": None,
+        "sfreq_fif": None,
+        "duration_sec": None,
+        "resampled": False,
+        "only_ctf": [],
+        "only_fif": [],
+        "flat_channels": [],
+        "low_correlation_channels": [],
+        "corr": None,
+        "n_nan": 0,
+        "worst_channels": [],
+    }
+    try:
+        raw_ctf = mne.io.read_raw_ctf(str(ctf_path), preload=True, verbose="WARNING")
+        raw_fif = mne.io.read_raw_fif(str(fif_path), preload=True, verbose="WARNING")
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        result["reason"] = "could not read input(s)"
+        return result
+
+    result["n_channels_ctf"] = len(raw_ctf.ch_names)
+    result["n_channels_fif"] = len(raw_fif.ch_names)
+    result["sfreq_ctf"] = float(raw_ctf.info["sfreq"])
+    result["sfreq_fif"] = float(raw_fif.info["sfreq"])
+    if len(raw_fif.times):
+        result["duration_sec"] = round(float(raw_fif.times[-1]), 2)
+
+    if result["sfreq_fif"] > 0 and abs(result["sfreq_ctf"] - result["sfreq_fif"]) > 0.01:
+        raw_ctf.resample(result["sfreq_fif"], verbose="WARNING")
+        result["sfreq_ctf"] = float(raw_ctf.info["sfreq"])
+        result["resampled"] = True
+
+    fif_set = set(raw_fif.ch_names)
+    ctf_set = set(raw_ctf.ch_names)
+    common = [ch for ch in raw_ctf.ch_names if ch in fif_set]
+    result["only_ctf"] = [ch for ch in raw_ctf.ch_names if ch not in fif_set]
+    result["only_fif"] = [ch for ch in raw_fif.ch_names if ch not in ctf_set]
+    result["channels_compared"] = len(common)
+
+    if not common:
+        result["reason"] = "no common channels between CTF and FIF"
+        return result
+
+    common_times = np.intersect1d(raw_ctf.times, raw_fif.times)
+    if common_times.size == 0:
+        result["reason"] = "no overlapping time samples between CTF and FIF"
+        return result
+    data_ctf = raw_ctf.get_data(picks=common)[:, raw_ctf.time_as_index(common_times)]
+    data_fif = raw_fif.get_data(picks=common)[:, raw_fif.time_as_index(common_times)]
+
+    corr = _row_correlation(data_ctf, data_fif)
+    result["n_nan"] = int(np.isnan(corr).sum())
+    valid = ~np.isnan(corr)
+    if valid.any():
+        good = corr[valid]
+        result["score"] = round(float(np.median(good)), 6)
+        result["corr"] = {
+            "count": int(good.size),
+            "min": round(float(good.min()), 6),
+            "p05": round(float(np.percentile(good, 5)), 6),
+            "median": round(float(np.median(good)), 6),
+            "p95": round(float(np.percentile(good, 95)), 6),
+            "max": round(float(good.max()), 6),
+            "lt_low": int((good < QA_LOW).sum()),
+            "lt_pass": int((good < QA_PASS).sum()),
+        }
+        result["low_correlation_channels"] = [
+            common[i] for i in range(len(common)) if valid[i] and corr[i] < QA_LOW
+        ]
+        order = np.argsort(np.where(valid, corr, np.inf))
+        result["worst_channels"] = [
+            (common[i], round(float(corr[i]), 6)) for i in order[:10] if valid[i]
+        ]
+
+    std = data_fif.std(axis=1)
+    positive = std[std > 0]
+    ref_std = float(np.median(positive)) if positive.size else 0.0
+    flat_mask = std <= max(QA_FLAT_ABS, QA_FLAT_REL * ref_std)
+    result["flat_channels"] = [common[i] for i in np.nonzero(flat_mask)[0]]
+
+    if result["score"] is None:
+        result["reason"] = "all channel correlations undefined (constant/flat data)"
+    elif result["score"] >= QA_PASS and not result["low_correlation_channels"]:
+        result["status"] = "PASS"
+    elif result["score"] >= QA_WARN:
+        result["status"] = "WARN"
+    else:
+        result["status"] = "FAIL"
+
+    if (result["only_ctf"] or result["only_fif"]) and result["status"] != "FAIL":
+        result["status"] = "FAIL"
+        result["reason"] = "channel set mismatch between CTF and FIF"
+    return result
+
+
+def _fmt_list(items) -> str:
+    return ", ".join(items) if items else "none"
+
+
+def format_qa_report(result: dict, ctf_path, fif_path) -> str:
+    """Render a QA result as a human-reviewable plain-text report."""
+    lines = []
+    add = lines.append
+    add("CTF/FIF QA COMPARISON REPORT")
+    add(f"Generated : {datetime.now().isoformat(timespec='seconds')}")
+    add(f"CTF source: {ctf_path}")
+    add(f"FIF input : {fif_path}")
+    add("")
+    add(f"RESULT: {result['status']}")
+    if result.get("reason"):
+        add(f"Reason: {result['reason']}")
+    if result.get("error"):
+        add(f"Error : {result['error']}")
+    add("")
+    add("Data properties")
+    add(f"  Channels    : CTF={result['n_channels_ctf']} "
+        f"FIF={result['n_channels_fif']} compared={result['channels_compared']}")
+    add(f"  Sampling Hz : CTF={result['sfreq_ctf']} FIF={result['sfreq_fif']}")
+    add(f"  Duration s  : {result['duration_sec']}")
+    add(f"  Resampled CTF to FIF sfreq : {'yes' if result['resampled'] else 'no'}")
+    add(f"  Channels only in CTF : {_fmt_list(result['only_ctf'])}")
+    add(f"  Channels only in FIF : {_fmt_list(result['only_fif'])}")
+    add("")
+    add("Correlation (per common channel)")
+    if result.get("corr"):
+        c = result["corr"]
+        add(f"  Count        : {c['count']}")
+        add(f"  min          : {c['min']}")
+        add(f"  p05          : {c['p05']}")
+        add(f"  median       : {c['median']}")
+        add(f"  p95          : {c['p95']}")
+        add(f"  max          : {c['max']}")
+        add(f"  undefined    : {result['n_nan']}")
+        add(f"  < {QA_LOW}     : {c['lt_low']}")
+        add(f"  < {QA_PASS}     : {c['lt_pass']}")
+    else:
+        add("  (not computed)")
+        add(f"  undefined    : {result['n_nan']}")
+    add("")
+    add("Channel issues")
+    add(f"  Flat/dead channels (FIF, near-zero variance) : "
+        f"{_fmt_list(result['flat_channels'])}")
+    add(f"  Low-correlation channels (<{QA_LOW}) : "
+        f"{_fmt_list(result['low_correlation_channels'])}")
+    add("")
+    add("Worst channels by correlation")
+    if result["worst_channels"]:
+        for name, r in result["worst_channels"]:
+            add(f"  {name:<24} {r}")
+    else:
+        add("  (none)")
+    add("")
+    add(f"Legend: PASS = score >= {QA_PASS} and no low-correlation channels; "
+        f"WARN = score >= {QA_WARN}; FAIL = otherwise or structural mismatch.")
+    return "\n".join(lines) + "\n"
+
+
+def append_qa_report(report_path: Path, result: dict, ctf_path, fif_path) -> None:
+    """Append a QA comparison block to the current run's report file."""
+    block = format_qa_report(result, ctf_path, fif_path)
+    rule = "=" * 72
+    with open(report_path, "a", encoding="utf-8") as f:
+        f.write(f"\n{rule}\n{block}{rule}\n")
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Convert CTF .ds datasets to FIF.")
-    p.add_argument("inputs", nargs="+", type=Path, help="one or more .ds directories")
+    p.add_argument("inputs", nargs="*", type=Path, help="one or more .ds directories")
     p.add_argument("-o", "--out", type=Path,
                    help="output .fif path (requires a single input); "
                         "default: <stem>_raw.fif in the current directory")
@@ -183,6 +386,9 @@ def parse_args(argv=None):
     p.add_argument("--overwrite", action="store_true", help="overwrite existing FIF files")
     p.add_argument("--report-dir", type=Path, default=Path("reports"),
                    help="where report logs are written (default: ./reports)")
+    p.add_argument("--qa", action="store_true",
+                   help="after each conversion, add a QA comparison of the input "
+                        ".ds against its output .fif to the report")
     return p.parse_args(argv)
 
 
@@ -202,6 +408,8 @@ def main(argv=None) -> int:
         unknown = set(presets) - {d["field"] for d in defs}
         if unknown:
             raise ValueError(f"--set for undefined field(s): {', '.join(sorted(unknown))}")
+        if not args.inputs:
+            raise ValueError("no inputs given")
         if args.out is not None and len(args.inputs) != 1:
             raise ValueError("--out requires exactly one input")
         (args.out.parent if args.out else Path(".")).mkdir(parents=True, exist_ok=True)
@@ -211,7 +419,7 @@ def main(argv=None) -> int:
         return 2
 
     interactive = sys.stdin.isatty() and not args.no_prompt
-    ok, failed = 0, 0
+    ok, failed, qa_failed = 0, 0, 0
     for ds in args.inputs:
         out_path = args.out if args.out is not None else Path(f"{ds.stem}_raw.fif")
         try:
@@ -225,9 +433,23 @@ def main(argv=None) -> int:
             log.error("FAILED: %s: %s: %s", ds, type(e).__name__, e)
             log.debug("Traceback:\n%s", traceback.format_exc())
             failed += 1
+            continue
 
-    log.info("Done: %d converted, %d failed. Report: %s", ok, failed, report)
-    return 1 if failed else 0
+        if args.qa:
+            try:
+                result = run_qa(ds, out)
+                append_qa_report(report, result, ds, out)
+                log.info("QA %s: %s (score=%s)", out, result["status"], result["score"])
+                if result["status"] == "FAIL":
+                    qa_failed += 1
+            except Exception as e:
+                log.error("QA failed for %s: %s: %s", out, type(e).__name__, e)
+                log.debug("Traceback:\n%s", traceback.format_exc())
+                qa_failed += 1
+
+    log.info("Done: %d converted, %d failed, %d QA failures. Report: %s",
+             ok, failed, qa_failed, report)
+    return 1 if (failed or qa_failed) else 0
 
 
 if __name__ == "__main__":
