@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Build a standalone Linux executable of ctf2fif with Nuitka.
+# Build a standalone Linux executable of ctf2fif with PyInstaller.
 #
 # Usage:
-#   ./build.sh            # standalone folder -> dist/ctf2fif.dist/
-#   ONEFILE=1 ./build.sh  # single self-extracting file -> dist/ctf2fif.bin
-#   COMPACT=1 ./build.sh  # extra size trimming (drops mne tests, uses LTO)
+#   ./build.sh            # single-file executable -> dist/ctf2fif
+#   ONEFILE=0 ./build.sh  # one-dir bundle -> dist/ctf2fif/ctf2fif
+#   COMPACT=1 ./build.sh  # extra size trimming (strips binaries, drops mne tests)
 #
 # Environment:
 #   PY        Python interpreter to build with (default: .venv/bin/python)
-#   ONEFILE   set to 1 to produce a single-file executable
-#   COMPACT   set to 1 to enable LTO and strip test-only imports
-#   JOBS      parallel compile jobs (default: nproc)
+#   ONEFILE   set to 0 to produce a one-dir bundle instead of a single file
+#   COMPACT   set to 1 to strip binaries and exclude test-only imports
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -21,45 +20,47 @@ if [[ ! -x "$PY" ]]; then
     exit 1
 fi
 
-if ! "$PY" -c "import nuitka" 2>/dev/null; then
-    echo "error: nuitka not installed for '$PY'" >&2
+if ! "$PY" -c "import PyInstaller" 2>/dev/null; then
+    echo "error: PyInstaller not installed for '$PY'" >&2
     echo "       install build deps:  uv pip install --python '$PY' -r requirements-build.txt" >&2
     exit 1
 fi
 
+mkdir -p build dist
+
 args=(
-    --standalone
-    --assume-yes-for-downloads
-    --enable-plugin=numpy
-    --include-package=mne
-    --include-package-data=mne
-    --include-data-file=fields.json=fields.json
-    --output-dir=dist
-    --output-filename=ctf2fif
-    --show-progress
-    --jobs="${JOBS:-$(nproc)}"
+    --noconfirm
+    --clean
+    --onefile
+    --name=ctf2fif
+    --distpath=dist
+    --workpath=build
+    --specpath=build
+    --collect-all=mne
+    --copy-metadata=mne
 )
 
-if [[ "${ONEFILE:-0}" == "1" ]]; then
-    args+=(--onefile)
-fi
-
-if [[ "${COMPACT:-0}" == "1" ]]; then
-    # LTO lets gcc optimize across compiled modules; dropping mne's test
-    # tree keeps a large amount of code and data out of the build.
+if [[ "${ONEFILE:-1}" == "0" ]]; then
     args+=(
-        --lto=yes
-        --nofollow-import-to=mne.tests
+        --onedir
     )
 fi
 
-echo "==> Building ctf2fif with $("$PY" -m nuitka --version | head -1)"
-"$PY" -m nuitka "${args[@]}" ctf2fif.py
+if [[ "${COMPACT:-0}" == "1" ]]; then
+    # Strip native libraries and keep mne's test tree out of the bundle.
+    args+=(
+        --strip
+        --exclude-module=mne.tests
+    )
+fi
 
-if [[ "${ONEFILE:-0}" == "1" ]]; then
-    # Nuitka names the onefile executable <output-filename>.bin on Linux.
-    built="$(find dist -maxdepth 1 -name 'ctf2fif*' -type f -perm -u+x | head -1)"
-    echo "==> Built: ${built:-dist/ctf2fif*}"
+echo "==> Building ctf2fif with PyInstaller $("$PY" -c 'import PyInstaller; print(PyInstaller.__version__)')"
+"$PY" -m PyInstaller "${args[@]}" ctf2fif.py
+
+cp fields.json dist/fields.json
+
+if [[ "${ONEFILE:-1}" == "0" ]]; then
+    echo "==> Built: dist/ctf2fif/ctf2fif"
 else
-    echo "==> Built: dist/ctf2fif.dist/ctf2fif"
+    echo "==> Built: dist/ctf2fif"
 fi

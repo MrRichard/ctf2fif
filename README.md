@@ -18,6 +18,28 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+## Building a standalone executable
+
+[PyInstaller](https://pyinstaller.org/) bundles the tool and MNE into a single
+executable. It does not require `patchelf` or administrator rights:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-build.txt
+./build.sh
+```
+
+This produces `dist/ctf2fif`, a self-contained Linux executable, and copies
+`fields.json` alongside it. Other modes:
+
+```bash
+ONEFILE=0 ./build.sh   # one-dir bundle -> dist/ctf2fif/ctf2fif (faster startup)
+COMPACT=1 ./build.sh   # strip binaries and drop mne's test tree
+```
+
+The binary is built for the platform and Python version used to run the build,
+so build it on (or for) the oldest glibc you need to support.
+
 ## Usage
 
 Convert a single dataset:

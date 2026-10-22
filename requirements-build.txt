@@ -1,4 +1,2 @@
 # Build-time only; not needed to run from source.
-nuitka==4.3
-zstandard
-ordered-set
+pyinstaller>=6.0

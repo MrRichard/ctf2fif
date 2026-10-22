@@ -3,9 +3,7 @@ sample_outputs/
 reports/
 __pycache__/
 
-# Nuitka build artifacts
+# PyInstaller build artifacts
 dist/
 build/
-*.build/
-*.dist/
-*.onefile-build/
+*.spec
