@@ -12,18 +12,5 @@
     "pattern": "^[A-Za-z0-9_-]{1,32}$",
     "target": "proj_name",
     "required": true
-  },
-  {
-    "field": "experimenter",
-    "prompt": "Experimenter initials",
-    "pattern": "^[A-Z]{2,4}$",
-    "target": "experimenter",
-    "required": false
-  },
-  {
-    "field": "session_id",
-    "prompt": "Session ID (e.g. S01)",
-    "pattern": "^S\\d{2}$",
-    "required": false
   }
 ]
