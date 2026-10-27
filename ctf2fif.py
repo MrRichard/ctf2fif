@@ -41,7 +41,51 @@ QA_LOW = 0.99            # per-channel correlation below this is "low"
 QA_FLAT_REL = 1e-9       # channel std below this fraction of the median std is flat
 QA_FLAT_ABS = 0.0        # absolute std floor for flat-channel detection
 
+# Memory guards.
+# CTF .ds files store data in trials; MNE sizes its read/write buffers after
+# the trial length (res4 "nsamp"). A .ds written as a single long trial makes
+# MNE load the whole recording as one buffer, which multiplies peak RAM by
+# recording length and gets long files killed by the OOM killer ("Killed" with
+# no error message). Capping buffers by BYTES keeps every fetch small no
+# matter how the data was stored.
+SAVE_CHUNK_BYTES = 256 * 1024 * 1024   # max float64 bytes per FIF write buffer
+QA_CHUNK_BYTES = 128 * 1024 * 1024     # max float64 bytes per QA chunk (x2 sides)
+
 log = logging.getLogger("ctf2fif")
+
+
+def _chunk_samples(n_channels: int, budget_bytes: int) -> int:
+    """Samples per fetch so one (n_channels, samples) float64 array stays <= budget."""
+    return max(1, budget_bytes // (8 * max(1, n_channels)))
+
+
+def _mem_available_bytes():
+    """Bytes of RAM the kernel says are available (Linux only; None elsewhere)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _warn_if_memory_tight(needed_bytes: int, context: str) -> None:
+    """Warn when a step is expected to approach the machine's available RAM.
+
+    Without this the OOM killer just SIGKILLs the process (the shell prints a
+    bare "Killed") and no traceback or report line is ever written.
+    """
+    avail = _mem_available_bytes()
+    if avail is not None and needed_bytes > 0.75 * avail:
+        log.warning(
+            "%s is expected to need ~%.1f GB of RAM but only ~%.1f GB is "
+            "available. If the process dies with a bare 'Killed' message, "
+            "that is the kernel OOM killer; free memory or run under a "
+            "memory cap (ulimit -v) to get a real traceback instead.",
+            context, needed_bytes / (1 << 30), avail / (1 << 30),
+        )
 
 
 def setup_logging(report_dir: Path) -> Path:
@@ -159,6 +203,21 @@ def convert(ds: Path, out: Path, defs: list, presets: dict,
     raw = mne.io.read_raw_ctf(str(ds), preload=False, verbose="WARNING")
     apply_fields(raw.info, defs, values)
 
+    # CTF data is int32 on disk; MNE reads whole trials into an int32 temp
+    # before scaling to float64. Worst case that temp is the size of the
+    # whole recording, so warn before we push against the RAM ceiling
+    # (see _warn_if_memory_tight).
+    n_ch, n_times = len(raw.ch_names), len(raw.times)
+    _warn_if_memory_tight(
+        4 * n_ch * n_times + SAVE_CHUNK_BYTES,
+        f"Converting {ds.name} ({n_ch} channels, {n_times} samples)",
+    )
+
+    # Cap the writer's fetch buffer by bytes. MNE would otherwise size it
+    # after the .ds trial length (res4 nsamp); a .ds stored as one long
+    # trial then reads/writes the entire recording per buffer.
+    buffer_sec = _chunk_samples(n_ch, SAVE_CHUNK_BYTES) / raw.info["sfreq"]
+
     # Do the write in a scratch dir inside the destination directory, then move
     # the finished file(s) into place and always remove the scratch dir.
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -166,7 +225,9 @@ def convert(ds: Path, out: Path, defs: list, presets: dict,
     tmp_dir.mkdir()
     try:
         written = [Path(f) for f in raw.save(str(tmp_dir / out.name),
-                                             overwrite=True, verbose="WARNING")]
+                                             overwrite=True,
+                                             buffer_size_sec=buffer_sec,
+                                             verbose="WARNING")]
         os.replace(written[0], out)
         for extra in written[1:]:
             os.replace(extra, out.parent / extra.name)
@@ -176,27 +237,14 @@ def convert(ds: Path, out: Path, defs: list, presets: dict,
     return out
 
 
-def _row_correlation(a, b):
-    """Pearson correlation per row between two (n_channels, n_samples) arrays.
-
-    Rows with zero variance (e.g. flat channels) yield NaN instead of raising.
-    """
-    import numpy as np
-
-    a = a - a.mean(axis=1, keepdims=True)
-    b = b - b.mean(axis=1, keepdims=True)
-    denom = np.sqrt((a * a).sum(axis=1) * (b * b).sum(axis=1))
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return (a * b).sum(axis=1) / denom
-
-
 def run_qa(ctf_path: Path, fif_path: Path) -> dict:
     """Compare a source CTF .ds against a converted FIF file.
 
     Returns a result dict describing the PASS/WARN/FAIL status plus the
     numbers needed to build a human-reviewable report (see format_qa_report).
+    The comparison itself streams in memory-bounded chunks -- see
+    _compare_raws.
     """
-    import numpy as np
     import mne
 
     result = {
@@ -219,13 +267,33 @@ def run_qa(ctf_path: Path, fif_path: Path) -> dict:
         "n_nan": 0,
         "worst_channels": [],
     }
+
     try:
-        raw_ctf = mne.io.read_raw_ctf(str(ctf_path), preload=True, verbose="WARNING")
-        raw_fif = mne.io.read_raw_fif(str(fif_path), preload=True, verbose="WARNING")
+        raw_ctf = mne.io.read_raw_ctf(str(ctf_path), preload=False, verbose="WARNING")
+        raw_fif = mne.io.read_raw_fif(str(fif_path), preload=False, verbose="WARNING")
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["reason"] = "could not read input(s)"
         return result
+
+    return _compare_raws(raw_ctf, raw_fif, result, label=ctf_path.name)
+
+
+def _compare_raws(raw_ctf, raw_fif, result: dict, label: str = "") -> dict:
+    """Populate the QA result dict by comparing two raw objects channel by channel.
+
+    Both datasets are streamed in time chunks with byte-capped buffers, so
+    peak RAM is bounded by the chunk size plus MNE's internal per-trial read
+    buffer -- not by the length of the recording. A whole-recording CTF
+    chunk would otherwise need ~5-6 float64 copies of the data at once and
+    gets long files killed by the kernel OOM killer.
+
+    If the CTF and FIF sampling rates differ the QA returns FAIL with a
+    reason: this tool compares a conversion against its own source, so a
+    rate mismatch can only mean the conversion (or the FIF) is wrong. The
+    sampling rate is still recorded in the result for the report.
+    """
+    import numpy as np
 
     result["n_channels_ctf"] = len(raw_ctf.ch_names)
     result["n_channels_fif"] = len(raw_fif.ch_names)
@@ -235,9 +303,12 @@ def run_qa(ctf_path: Path, fif_path: Path) -> dict:
         result["duration_sec"] = round(float(raw_fif.times[-1]), 2)
 
     if result["sfreq_fif"] > 0 and abs(result["sfreq_ctf"] - result["sfreq_fif"]) > 0.01:
-        raw_ctf.resample(result["sfreq_fif"], verbose="WARNING")
-        result["sfreq_ctf"] = float(raw_ctf.info["sfreq"])
-        result["resampled"] = True
+        result["reason"] = (
+            f"sampling rates differ: CTF={result['sfreq_ctf']} Hz, "
+            f"FIF={result['sfreq_fif']} Hz; a conversion by this tool should "
+            "preserve the source rate"
+        )
+        return result
 
     fif_set = set(raw_fif.ch_names)
     ctf_set = set(raw_ctf.ch_names)
@@ -250,14 +321,52 @@ def run_qa(ctf_path: Path, fif_path: Path) -> dict:
         result["reason"] = "no common channels between CTF and FIF"
         return result
 
-    common_times = np.intersect1d(raw_ctf.times, raw_fif.times)
-    if common_times.size == 0:
+    n_times = min(len(raw_ctf.times), len(raw_fif.times))
+    if len(raw_ctf.times) != len(raw_fif.times):
+        log.info(
+            "QA: CTF has %d samples but FIF has %d; comparing the first %d",
+            len(raw_ctf.times), len(raw_fif.times), n_times,
+        )
+    if n_times == 0:
         result["reason"] = "no overlapping time samples between CTF and FIF"
         return result
-    data_ctf = raw_ctf.get_data(picks=common)[:, raw_ctf.time_as_index(common_times)]
-    data_fif = raw_fif.get_data(picks=common)[:, raw_fif.time_as_index(common_times)]
 
-    corr = _row_correlation(data_ctf, data_fif)
+    n_ch_cmp = len(common)
+    chunk = _chunk_samples(n_ch_cmp, QA_CHUNK_BYTES)
+    _warn_if_memory_tight(
+        4 * result["n_channels_ctf"] * len(raw_ctf.times) + 3 * n_ch_cmp * chunk * 8,
+        f"QA of {label}" if label else "QA",
+    )
+
+    # Stream both datasets in chunks, accumulating per-channel Pearson sums.
+    # Keeping only sums means peak RAM is O(chunk), never O(recording).
+    n = 0
+    sx = np.zeros(n_ch_cmp)
+    sy = np.zeros(n_ch_cmp)
+    sxx = np.zeros(n_ch_cmp)
+    syy = np.zeros(n_ch_cmp)
+    sxy = np.zeros(n_ch_cmp)
+    for start in range(0, n_times, chunk):
+        stop = min(start + chunk, n_times)
+        x = raw_ctf.get_data(picks=common, start=start, stop=stop)
+        y = raw_fif.get_data(picks=common, start=start, stop=stop)
+        n += stop - start
+        sx += x.sum(axis=1)
+        sy += y.sum(axis=1)
+        sxx += np.einsum("ij,ij->i", x, x)
+        syy += np.einsum("ij,ij->i", y, y)
+        sxy += np.einsum("ij,ij->i", x, y)
+        del x, y
+
+    mean_x = sx / n
+    mean_y = sy / n
+    var_x = sxx / n - mean_x * mean_x
+    var_y = syy / n - mean_y * mean_y
+    cov = sxy / n - mean_x * mean_y
+    denom = np.sqrt(np.maximum(var_x, 0.0) * np.maximum(var_y, 0.0))
+    corr = np.full(n_ch_cmp, np.nan)
+    np.divide(cov, denom, out=corr, where=denom > 0)
+
     result["n_nan"] = int(np.isnan(corr).sum())
     valid = ~np.isnan(corr)
     if valid.any():
@@ -281,7 +390,8 @@ def run_qa(ctf_path: Path, fif_path: Path) -> dict:
             (common[i], round(float(corr[i]), 6)) for i in order[:10] if valid[i]
         ]
 
-    std = data_fif.std(axis=1)
+    # FIF channel std over the compared samples, from the accumulated sums.
+    std = np.sqrt(np.maximum(var_y, 0.0))
     positive = std[std > 0]
     ref_std = float(np.median(positive)) if positive.size else 0.0
     flat_mask = std <= max(QA_FLAT_ABS, QA_FLAT_REL * ref_std)
